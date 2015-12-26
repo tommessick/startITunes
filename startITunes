@@ -1,0 +1,420 @@
+#!/usr/bin/env perl
+
+use FindBin qw($Bin); 
+BEGIN { push @INC, $Bin; }
+
+use strict;
+use Mac::iTunes::Library::XML;
+use File::Spec;
+use URI::Escape;
+use Mac::AppleScript qw(RunAppleScript);
+use Data::Dumper qw(Dumper); 
+use Date::Calc qw(Date_to_Time);
+use URI::Escape;
+use List::Util qw[min max];
+use Getopt::Long;
+use Album;
+
+my $total = 0;
+my @dirs;
+my $album;
+my $artist;
+my %albums = ();
+my $deltaLimit = 60 * 60 * 24 * 365 * 2;   # Two years in seconds
+my $appleScript;
+my $newestAlbum;
+
+# The playlist name
+my $playlistName = "oldest";
+# Should we play the playlist now?
+my $noplay = 0;
+# How much to skip at the start (mb)
+my $start = 0;
+# How bit can the playlist grow (mb)
+my $limit = 6 * 1024 * 1024 * 1024;       # 6 GB about a day
+# Is this for the iPod?
+my $pod = 0;
+# Are we adding podcasts or music?
+my $playPodcasts = 0;
+# Are we adding files or starting over
+my $noclear = 0;
+# Will we run even though we already ran today?
+my $again = 0;
+
+my $result = GetOptions("playlist=s" => \$playlistName,
+                        "noplay"     => \$noplay,
+                        "start=i"    => \$start,
+                        "size=i"     => \$limit,
+                        "pod"        => \$pod,
+                        "podcasts"   => \$playPodcasts,
+                        "noclear"    => \$noclear,
+                        "again"      => \$again);
+
+print ("playlist $playlistName\n" .
+       "noplay   $noplay\n"       .
+       "start    $start\n"        .
+       "size     $limit\n"        .
+       "pod      $pod\n"          .
+       "podcasts $playPodcasts\n" .
+       "again    $again\n");
+
+my @days = qw( Sun Mon Tue Wed Thu Fri Sat );
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+
+my $logName = "log$days[$wday]$playlistName.";
+
+my $age = (-M $logName . "txt") * 24;
+if ($age < 2.0) {
+    # The log is from today
+    # The Mac likes to reboot and then play all day while I am at work
+    # require the -again flag to run
+    if (!$again) {
+        print sprintf("Quitting because we ran %3.2f hours ago\n" .
+                      "Rerun with the -again flag to continue\n", $age);
+        exit;
+    }
+}
+
+open LOG, ">$logName" . "txt";
+binmode LOG, ":utf8";
+open LOGA, ">$logName" . "scpt";
+binmode LOGA, ":utf8";
+
+# iTunes uses 1904 instead of 1970 as the time epoch
+# Use values pulled from an actual iTunes file to calc the diffeerence
+# We Will use this later to prevent replaying songs that were played yesterday
+my $iTime = 3379181040;
+my $uTime = Date_to_Time(2011,01,30,5,24,00);
+my $timeAdj = $iTime - $uTime;
+
+##############
+# Run iTunes #
+##############
+
+$appleScript  = "tell application \"iTunes\"\n" .
+                "    launch\n";
+if ($noplay == 0) {
+    $appleScript .= "    stop\n";
+}
+
+$appleScript .= "end tell\n";
+RunAppleScript($appleScript);
+print LOGA $appleScript;
+
+###########################
+# Initialize the playlist #
+###########################
+
+resetPlaylist($playlistName);
+
+#########################################
+# Make sure the remote drive is mounted #
+#########################################
+
+while (! -e '/Volumes/Music/itunes')
+{
+    print "mounting\n";
+    $appleScript = "" .
+        "tell application \"Finder\"\n" .
+        "    activate\n" .
+        "    try\n" .
+        "        mount volume  \"afp://gordo\"\n" .
+        "    end try\n" .
+        "end tell\n";
+
+    RunAppleScript($appleScript);
+    print LOGA $appleScript;
+};
+
+########################
+# Get the library info #
+########################
+
+my $lib = Mac::iTunes::Library::XML->parse("/Users/Tom/Music/iTunes/iTunes Music Library.xml");
+my %items = $lib->items();
+
+sub want {
+    my $item = shift;
+    my ($vol, $dir, $file) = File::Spec->splitpath($item->location);
+    my $isPodcast;
+
+    # We don't want unchecked files
+    if ((exists  $item->{Disabled}) &&
+        (defined $item->{Disabled}) &&
+        ($item->{Disabled} == 1)) {
+        return 0;
+    }
+
+    # We don't want remote files
+    if ((exists  $item->{'Track Type'}) &&
+        (defined $item->{'Track Type'}) &&
+        ($item->{'Track Type'} eq "Remote")) {
+        return 0;
+    }
+
+    # We don't want applications
+    if ((exists  $item->{'Location'}) &&
+        (defined $item->{'Location'}) &&
+        ($item->{'Location'} =~ /Applications/)) {
+        return 0;
+    }
+
+    $isPodcast = (($dir =~ /Podcasts/) || 
+        ($item->{Genre} eq 'Podcast')  ||
+        ($item->{Podcast} == 1));
+
+    if ($playPodcasts) {
+        if ($isPodcast) {
+            if (defined ($item->{'Play Date'})) {
+                # Only play a podcast once ever
+                return 0
+            } else {
+                return 1;
+            }
+        }
+    } else {
+        return (!$isPodcast);
+    }
+    return 0;
+}
+
+##################################################################
+# Scan the library and build albums                              #
+# output:                                                        #
+#   $albums = hash of all albums                                 #
+#   $lastAlbum = album that was playing when iTunes stopped last #
+##################################################################
+
+my $newestItem;
+
+foreach my $artist (keys %items) {
+    my $artistSongs = $items{$artist};
+
+    foreach my $songName (keys %$artistSongs) {
+        my $artistSongItems = $artistSongs->{$songName};
+
+        foreach my $item (@$artistSongItems) {
+            $total++;
+            # Do something here to every item in the library
+            # Skip files that we don't want to see
+            if (want($item)) {
+                if (exists $item->{'Sort Album'}) {
+                    $album = $item->{'Sort Album'};
+                } else { 
+                    $album = $item->album;
+                }
+                unless (defined $item->{'Disc Number'}) {
+                    $item->{'Disc Number'} = 1;
+                }
+                unless (defined $item->{'Track Number'}) {
+                    $item->{'Track Number'} = 99;
+                }
+                # Songs that have never been played have an undefined playDate
+                # Give them a very old date (1970)
+                if (!defined $item->{'Play Date'}) {
+                    print "setting date for $item->{'Name'}\n";
+                    $item->{'Play Date'} = $timeAdj;
+                }
+                if (exists $albums{$album}) {
+                    $albums{$album}->addSong($item);
+                } else {
+                    my $temp = Album->new;
+                    $temp->name($album);
+                    $temp->addSong($item);
+                    $albums{$album} = $temp;
+                }
+                # Find album containing the last song played
+                if (!defined $newestAlbum) {
+                    $newestAlbum = $albums{$album};
+                    $newestItem = $item;
+                }
+                if ($item->playDate > $newestItem->playDate) {
+                    $newestItem = $item; 
+                    $newestAlbum = $albums{$album};
+                }
+            }
+        }
+    }
+}
+
+#####################
+# Fill the playlist #
+#####################
+
+
+my $albumName = '';
+my $skippedSize = 0;
+my $playSize = 0;
+my $skip = -1;
+
+if ($pod == 0) {
+    # We want to finish last album played 
+    $playSize = addAlbum($newestAlbum->name);
+}
+
+foreach my $key (sort timeAscending (keys( %albums)) ) {
+    if (($playPodcasts) || ($key  ne $newestAlbum->name)) {
+        if (($start > 0) && ($skippedSize < $start)) {
+            $skippedSize += $albums{$key}->size; 
+        } else {
+            if (($playSize + $albums{$key}->size) < $limit) {
+                $playSize += addAlbum($key);
+            }
+        }
+    }
+    # Don't wait for the whole playlist to be done before playing the first song
+    if ($noplay == 0) {
+        play();
+    }
+}
+
+sub addAlbum {
+    my $key = shift;
+    my $playSize = 0;
+    # Skip some albums.
+    # This is to break up big blocks of the same artist
+    $skip++;
+    $skip = 0 if ($skip > 2);
+    $skip = 0 if ($playPodcasts);
+    $skip = 0; # Disable for now
+    my @songs = sort bydiscandtrack $albums{$key}->songs;
+
+    foreach my $song (@songs) {
+        my $str = uri_unescape($song->album);
+        my $adding = ' ';
+        if ($albumName ne $str) {
+            $albumName = $str;
+            # Print album name with "disc" that do not have a sort name
+            # User must manualy add sortname to multi disc sets
+            if ($str =~ /disc/i) {
+                unless (defined $song->{'Sort Album'}) {
+                    print "$str\n";
+                }
+            }
+            print LOG macDate($albums{$key}->time) . "      $str\n";
+        }
+        # Make songs that have never been played immune to skipping
+        if ($song->{'Play Date'} == $timeAdj) {
+          $skip = 0;
+        }
+        # Don't replay any recently played songs
+        my $songTime = $song->{'Play Date'} - $timeAdj;
+        my $delta = time - $songTime;
+        if (($skip == 0) && ($delta > $deltaLimit)) {
+            $adding = "+";
+        }
+        print LOG macDate($song->{'Play Date'}) . " " . $adding;
+        print LOG "        " . $song->{'Track Nunber'} . " " .  $song->name() . "\n";
+
+        my $id = $song->{'Track ID'};
+        if ($adding eq '+') {
+
+            $appleScript = "tell application \"iTunes\"\n";
+            $appleScript .= "duplicate (every file track of library playlist 1 " .
+                            "whose database ID is $id) to user playlist \"$playlistName\"\n";
+            $playSize += $song->{'Size'};
+            $appleScript .= "end tell\n";
+            # Don't use the script if it contains no songs
+            if ($appleScript ne "tell application \"iTunes\"\n    try\n    end try\nend tell\n")
+            {
+                print LOG "xx>" . RunAppleScript($appleScript) . "<xx\n";
+                print LOGA $appleScript;
+            }
+        }
+    }
+    return $playSize;
+}
+
+sub play {
+    # This does not always work
+    $appleScript = " tell application \"iTunes\"\n" .
+                   "    set blah to the player state\n" .
+                   "end tell\n";
+
+    my $state = RunAppleScript($appleScript);
+    print LOGA $appleScript;
+
+    if ($state ne 'playing') {
+        print "State = $state\n";
+        $appleScript = " tell application \"iTunes\"\n" .
+                       "set the_playlist to user playlist \"$playlistName\"\n" .
+                       "set view of front window to the_playlist\n" .
+                       "play the_playlist\n" .
+                       "end tell\n";
+        RunAppleScript($appleScript);
+    }
+}
+
+
+$appleScript = " tell application \"iTunes\"\n" .
+               "set the_playlist to user playlist \"$playlistName\"\n" .
+               "set view of front window to the_playlist\n" .
+               "play the_playlist\n" .
+               "end tell\n";
+print LOGA $appleScript;
+print $total . "\n";
+
+sub resetPlaylist {
+    my $name = shift;
+    my $appleScript = '';
+    if (!$noclear) {
+        $appleScript .= "" .
+        "tell application \"iTunes\"\n" .
+        "    if user playlist \"$name\" exists then\n" .
+        "        try\n" .
+        "            delete tracks of user playlist \"$name\"\n" .
+        "        end try\n" .
+        "    end if\n" .
+        "end tell\n";
+    }
+
+    $appleScript .= "" .
+        "tell application \"iTunes\"\n" .
+        "    if not (user playlist \"$name\" exists) then\n" .
+        "        make new user playlist with properties {name:\"$name\"," .
+        "            shuffle:false, song repeat:none}\n" .
+        "    end if\n" .
+        "end tell\n";
+  RunAppleScript($appleScript);
+    print LOGA $appleScript;
+}
+
+# Sort methods
+
+sub bydiscandtrack {
+    if ($a->{'Disc Number'} == $b->{'Disc Number'}) {
+        ($a->trackNumber <=> $b->trackNumber);
+    } else {
+        ($a->{'Disc Number'} <=> $b->{'Disc Number'});
+    }
+}
+
+sub timeAscending {
+    ($albums{$a}->time) <=> ($albums{$b}->time);
+}
+
+sub nameAscending {
+    my ($avol, $adir, $afile) = File::Spec->splitpath($a->location);
+    my ($bvol, $bdir, $bfile) = File::Spec->splitpath($b->location);
+    # iTunes is set to put the track number first
+    # Some multi-disk albums have the track as 4-03
+    # This confuses the sort
+    # Change the 4- to spaces
+    $afile =~ s/\d-/  /g;
+    $bfile =~ s/\d-/  /g;
+    ($afile) <=> ($bfile);
+}
+
+# Apple does not use Unix time
+# Get a printable date from the number in the database
+sub macDate {
+    my $macDate = shift;
+    $macDate -= $timeAdj;
+    my @months = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime($macDate);
+    my $year = 1900 + $yearOffset;
+    my $theTime = sprintf("%2d:%02d:%02d, %s %s %2d, %4d",
+                          $hour, $minute, $second, $weekDays[$dayOfWeek], $months[$month], $dayOfMonth, $year);
+    return $theTime;
+}
