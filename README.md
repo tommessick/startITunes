@@ -3,8 +3,7 @@ Creates and plays a playlist sorted by album and oldest time played
 
 Requires modules Mac::iTunes::Library::XML and Mac::AppleScript
 
-
-Command line arguments
+Command line arguments:
 
 playlist    - The name of the playlist
 
