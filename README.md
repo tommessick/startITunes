@@ -1,8 +1,7 @@
 # startITunes
 Creates and plays a playlist sorted by album and oldest time played
 
-Command line arguments - Only the playlist name is required.
-
+Command line arguments
 
 playlist    - The name of the playlist
 

@@ -144,7 +144,7 @@ if ($netDrive ne '') {
 # Get the library info #
 ########################
 
-my $lib = Mac::iTunes::Library::XML->parse("~/Music/iTunes/iTunes Music Library.xml");
+my $lib = Mac::iTunes::Library::XML->parse($ENV{"HOME"} . "/Music/iTunes/iTunes Music Library.xml");
 my %items = $lib->items();
 
 ##################################################################
@@ -338,6 +338,7 @@ sub addAlbum {
             # Don't use the script if it contains no songs
             if ($appleScript ne "tell application \"iTunes\"\n    try\n    end try\nend tell\n")
             {
+                RunAppleScript($appleScript);
                 print LOGA $appleScript;
             }
         }
