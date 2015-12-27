@@ -1,8 +1,10 @@
 # startITunes
 Creates and plays a playlist sorted by album and oldest time played
 
-Command line arguments - Only the playlist name is required.
+Requires modules Mac::iTunes::Library::XML and Mac::AppleScript
 
+
+Command line arguments
 
 playlist    - The name of the playlist
 
