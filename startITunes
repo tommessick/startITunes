@@ -26,37 +26,49 @@ my $newestAlbum;
 
 # The playlist name
 my $playlistName = "oldest";
+# Are the songs out on a server?
+# This will be used as an argument to "mount volume"
+my $netDrive = '';
+# Full path to the iTunes folder
+my $musicPath = '~/Music/iTunes';
 # Should we play the playlist now?
 my $noplay = 0;
-# How much to skip at the start (mb)
+# How much to skip at the start (bytes)
+# This lets you have an ipod with different songs than the home system
 my $start = 0;
-# How bit can the playlist grow (mb)
-my $limit = 6 * 1024 * 1024 * 1024;       # 6 GB about a day
+# How bit can the playlist grow (bytes)
+my $limit = 6 * 1024 * 1024 * 1024;       # 6 GB is about a day
 # Is this for the iPod?
 my $pod = 0;
 # Are we adding podcasts or music?
 my $playPodcasts = 0;
-# Are we adding files or starting over
+# Are we adding more files or starting over
 my $noclear = 0;
 # Will we run even though we already ran today?
+# The MAC likes to reboot for updates after shutdown and then
+# play all day while I am at work
 my $again = 0;
 
-my $result = GetOptions("playlist=s" => \$playlistName,
-                        "noplay"     => \$noplay,
-                        "start=i"    => \$start,
-                        "size=i"     => \$limit,
-                        "pod"        => \$pod,
-                        "podcasts"   => \$playPodcasts,
-                        "noclear"    => \$noclear,
-                        "again"      => \$again);
+my $result = GetOptions("playlist=s"  => \$playlistName,
+                        "netDrive:s"  => \$netDrive,
+                        "musicPath:s" => \$musicPath,
+                        "noplay"      => \$noplay,
+                        "start=i"     => \$start,
+                        "size=i"      => \$limit,
+                        "pod"         => \$pod,
+                        "podcasts"    => \$playPodcasts,
+                        "noclear"     => \$noclear,
+                        "again"       => \$again);
 
-print ("playlist $playlistName\n" .
-       "noplay   $noplay\n"       .
-       "start    $start\n"        .
-       "size     $limit\n"        .
-       "pod      $pod\n"          .
-       "podcasts $playPodcasts\n" .
-       "again    $again\n");
+print ("playlist   $playlistName\n" .
+       "netDrive   $netDrive\n"     .
+       "musicPath  $musicPath\n"    .
+       "noplay     $noplay\n"       .
+       "start      $start\n"        .
+       "size       $limit\n"        .
+       "pod        $pod\n"          .
+       "podcasts   $playPodcasts\n" .
+       "again      $again\n");
 
 my @days = qw( Sun Mon Tue Wed Thu Fri Sat );
 my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
@@ -82,7 +94,7 @@ binmode LOGA, ":utf8";
 
 # iTunes uses 1904 instead of 1970 as the time epoch
 # Use values pulled from an actual iTunes file to calc the diffeerence
-# We Will use this later to prevent replaying songs that were played yesterday
+# We Will use this later to prevent replaying songs that were played recently
 my $iTime = 3379181040;
 my $uTime = Date_to_Time(2011,01,30,5,24,00);
 my $timeAdj = $iTime - $uTime;
@@ -111,72 +123,29 @@ resetPlaylist($playlistName);
 # Make sure the remote drive is mounted #
 #########################################
 
-while (! -e '/Volumes/Music/itunes')
-{
-    print "mounting\n";
-    $appleScript = "" .
+if ($netDrive ne '') {
+    while (! -e $musicPath)
+    {
+        print "mounting $netDrive\n";
+        $appleScript = "" .
         "tell application \"Finder\"\n" .
         "    activate\n" .
         "    try\n" .
-        "        mount volume  \"afp://gordo\"\n" .
+        "        mount volume  \"$netDrive\"\n" .
         "    end try\n" .
         "end tell\n";
 
-    RunAppleScript($appleScript);
-    print LOGA $appleScript;
-};
+        RunAppleScript($appleScript);
+        print LOGA $appleScript;
+    };
+}
 
 ########################
 # Get the library info #
 ########################
 
-my $lib = Mac::iTunes::Library::XML->parse("/Users/Tom/Music/iTunes/iTunes Music Library.xml");
+my $lib = Mac::iTunes::Library::XML->parse("~/Music/iTunes/iTunes Music Library.xml");
 my %items = $lib->items();
-
-sub want {
-    my $item = shift;
-    my ($vol, $dir, $file) = File::Spec->splitpath($item->location);
-    my $isPodcast;
-
-    # We don't want unchecked files
-    if ((exists  $item->{Disabled}) &&
-        (defined $item->{Disabled}) &&
-        ($item->{Disabled} == 1)) {
-        return 0;
-    }
-
-    # We don't want remote files
-    if ((exists  $item->{'Track Type'}) &&
-        (defined $item->{'Track Type'}) &&
-        ($item->{'Track Type'} eq "Remote")) {
-        return 0;
-    }
-
-    # We don't want applications
-    if ((exists  $item->{'Location'}) &&
-        (defined $item->{'Location'}) &&
-        ($item->{'Location'} =~ /Applications/)) {
-        return 0;
-    }
-
-    $isPodcast = (($dir =~ /Podcasts/) || 
-        ($item->{Genre} eq 'Podcast')  ||
-        ($item->{Podcast} == 1));
-
-    if ($playPodcasts) {
-        if ($isPodcast) {
-            if (defined ($item->{'Play Date'})) {
-                # Only play a podcast once ever
-                return 0
-            } else {
-                return 1;
-            }
-        }
-    } else {
-        return (!$isPodcast);
-    }
-    return 0;
-}
 
 ##################################################################
 # Scan the library and build albums                              #
@@ -268,6 +237,58 @@ foreach my $key (sort timeAscending (keys( %albums)) ) {
     }
 }
 
+print "$total Songs/Podcasts/Whatever found in XML file\n";
+
+# End of code
+
+# Decide what to include
+
+sub want {
+    my $item = shift;
+    my ($vol, $dir, $file) = File::Spec->splitpath($item->location);
+    my $isPodcast;
+
+    # We don't want unchecked files
+    if ((exists  $item->{Disabled}) &&
+        (defined $item->{Disabled}) &&
+        ($item->{Disabled} == 1)) {
+        return 0;
+    }
+
+    # We don't want remote files
+    if ((exists  $item->{'Track Type'}) &&
+        (defined $item->{'Track Type'}) &&
+        ($item->{'Track Type'} eq "Remote")) {
+        return 0;
+    }
+
+    # We don't want applications
+    if ((exists  $item->{'Location'}) &&
+        (defined $item->{'Location'}) &&
+        ($item->{'Location'} =~ /Applications/)) {
+        return 0;
+    }
+
+    $isPodcast = (($dir =~ /Podcasts/) || 
+        ($item->{Genre} eq 'Podcast')  ||
+        ($item->{Podcast} == 1));
+
+    if ($playPodcasts) {
+        if ($isPodcast) {
+            if (defined ($item->{'Play Date'})) {
+                # Only play a podcast once ever
+                return 0
+            } else {
+                return 1;
+            }
+        }
+    } else {
+        return (!$isPodcast);
+    }
+    return 0;
+}
+
+
 sub addAlbum {
     my $key = shift;
     my $playSize = 0;
@@ -285,7 +306,7 @@ sub addAlbum {
         if ($albumName ne $str) {
             $albumName = $str;
             # Print album name with "disc" that do not have a sort name
-            # User must manualy add sortname to multi disc sets
+            # User must manualy add sortname with iTunes to multi disc sets
             if ($str =~ /disc/i) {
                 unless (defined $song->{'Sort Album'}) {
                     print "$str\n";
@@ -317,7 +338,6 @@ sub addAlbum {
             # Don't use the script if it contains no songs
             if ($appleScript ne "tell application \"iTunes\"\n    try\n    end try\nend tell\n")
             {
-                print LOG "xx>" . RunAppleScript($appleScript) . "<xx\n";
                 print LOGA $appleScript;
             }
         }
@@ -344,15 +364,6 @@ sub play {
         RunAppleScript($appleScript);
     }
 }
-
-
-$appleScript = " tell application \"iTunes\"\n" .
-               "set the_playlist to user playlist \"$playlistName\"\n" .
-               "set view of front window to the_playlist\n" .
-               "play the_playlist\n" .
-               "end tell\n";
-print LOGA $appleScript;
-print $total . "\n";
 
 sub resetPlaylist {
     my $name = shift;
